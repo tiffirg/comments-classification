@@ -1,0 +1,544 @@
+# Отчет по препроцессингу и аугментации данных
+
+
+```{python}
+import re
+import nltk
+import emoji
+import emosent
+import pandas as pd
+import numpy as np
+import warnings
+import seaborn as sns
+from nltk.corpus import stopwords
+from string import punctuation as PUNCT
+from dostoevsky.tokenization import RegexTokenizer
+from dostoevsky.models import FastTextSocialNetworkModel
+from polyglot.detect import Detector
+from polyglot.detect.base import logger as polyglot_logger
+```
+
+Стоит фильтровать стоп-слова русского языка для использования TF-IDF как дополнительного признака в модель:
+```{python}
+warnings.filterwarnings("ignore")
+polyglot_logger.setLevel("ERROR")
+nltk.download("stopwords")
+RUSSIAN_STOPWORDS = set(stopwords.words("russian"))
+```
+
+```{python}
+sentiment_tokenizer = RegexTokenizer()
+sentiment_model = FastTextSocialNetworkModel(tokenizer=sentiment_tokenizer)
+```
+
+## Датасет
+
+```{python}
+dataset = pd.read_csv("practice_cleaned.csv")
+dataset.head()
+```
+
+Посмотрим на нынешние категории и их количество:
+
+```{python}
+dataset["Категория"].unique()
+```
+
+```{python}
+dataset["Категория"].value_counts()
+```
+
+```{python}
+categories = ['Видео', 'ДЗ', 'Лонгрид', 'Тест']
+```
+
+```{python}
+dataset[(dataset["Комментарий"].str.contains("куратор") | dataset["Комментарий"].str.contains("наставник"))]["Категория"].value_counts()
+```
+Вывод: категории 'Качество материалов', 'Общение с куратором', 'Интерфейс платформы' лучше отбросить, слишком мало данных для обучения. Категория 'Общение с куратором' по смысловому содержанию пересекается со всеми остальными категориями, поэтому вопрос существования этой категории стоит поставить под сомнение.
+
+<!-- ```{python}
+dataset = dataset[~dataset["Категория"].isin(['Качество материалов',
+                                              'Общение с куратором',
+                                              'Интерфейс платформы'])]
+``` -->
+
+Для будущего препроцессинга учтем упоминание ссылок:
+```{python}
+dataset[dataset["Комментарий"].str.contains("ССЫЛКА")]["Категория"].value_counts()
+``` 
+
+## Препроцессинг
+
+После зрительного просмотра данных были найдены такие дефекты, как: \
+ • Вместо ссылок в комментариях указано "ССЫЛКА". Было решено оставить с пониженным регистром, чтобы не мешать для будущих алгоритмов, например NER. По логике ссылки чаще всего встречаются в категории "Видео". \
+ • В комментариях часто упоминаются эмодзи, причем нескольких видов. Это как текстовые, например, ":)", это реальные эмодзи, к примеру, "😊", а также подобные этим "♥". Во-первых они все фильтруются для LLM, во-вторых из них изымается позитивность, негативность и нейтральность текста. \
+ • Также в тексте не редко можно увидеть восклицания - это тоже важная информация для понимания тональности текста. Количество восклицаний добавляется как еще один признак.
+ • В комментариях иногда попадаются куски кода, не редко видны ошибки. Так же попадаются ссылки на Telegram и другие соц.сети. По этим причинам фильтруются все возможные теги, все возможные пути, как абсолютные, так и относительные. \
+ • Пользователи выделяют некоторые слова кавычками, которые по итогу преобразуются в несколько кавычек подряд (2 и более), поэтому всё приводится к нормальному виду одной кавычки. 
+
+```{python}
+test_smiles = [":\)", ":\^\)", ":\(", "=\)", ":o\)",
+               ":D", "=D", ":-/", ":/", ":P", "=]",
+               ":-р", "8\)", "=O", ":-o", "X-\)",
+               "\^_\^", "o_O", "\$_\$", "\^o\^",
+               "\^3\^", "\*-\*", "<3", "\^3", ":\^\)"]
+
+def preprocessing_text(text):
+  neutral, positive, negative = 0, 0, 0
+  emojis = emosent.get_emoji_sentiment_rank_multiple(text)
+  amount_emojis = len(emojis)
+  if amount_emojis:
+    for emoji_symbol in emojis:
+      emoji_rank = emoji_symbol["emoji_sentiment_rank"]
+      positive += emoji_rank["positive"]
+      neutral += emoji_rank["neutral"]
+      negative += emoji_rank["negative"]
+    neutral, positive, negative = neutral / amount_emojis, positive / amount_emojis, negative / amount_emojis
+  text = emoji.replace_emoji(text, replace=' ')
+  text = re.sub(fr"{'|'.join(test_smiles)}", ' ', text)
+  text = re.sub(r'@[_A-Za-z0-9/\\-]+', ' ', text)
+  text = re.sub(r'C:\\{1,2}\S+\.\S+', ' ', text)
+  text = re.sub(r'[~_A-Za-z0-9-]+/[~_A-Za-z0-9-/.]+\.[~_A-Za-z0-9-\.]+', ' ', text)
+  text = re.sub(r'/[~_A-Za-z0-9-]+/[~_A-Za-z0-9-/][,:]?', ' ', text)
+  text = re.sub(r'\([^\S\n]*\)', ' ', text)
+  text = re.sub(r'"{2,4}', '"', text)
+  text = re.sub("[^\S\n]+", " ", text)
+  text = re.sub("ССЫЛКА", 'ссылка', text)
+  text = rf"{text}"
+  text = re.sub(r"\\n", " ", text)
+  text = re.sub(r"\\t", " ", text)
+  text = text.strip()
+  amount_exclamations = 0
+  for symbol in text:
+    if symbol == "!":
+      amount_exclamations += 1
+  return text, neutral, positive, negative, amount_exclamations
+```
+
+Одна из основных проблем данных - наличие кода на разных языках программирования. В основном язык коментариев - русский, при этом языки программирования оперируют английским. Лаконичное решение фильтрации текста - воспользоваться моделями для детектирования языков, тем самым детектируя наличие кода:
+
+ • Во-первых будем проходить текст по предложениям, предсказывая множество языков в каждом предложении \
+ • Во-вторых заметим, что русский относится к славянским языкам, так что детектор может рассматривать их вместо него \
+ • В-третьих поставим порог по инославянским языкам - 30% текста, для определения является ли предложение кодом \
+ • В-четвертых будем удалять предложения в которых стоп слова - "input", "print" и т.д.\
+```{python}
+def filter_code(text: str, filter_unknown_language=True) -> bool:
+    code_stop_words = ["input", "print", "cin", "cout"]
+    threshold = 30
+    result_text = []
+    have_code = False
+    for line in text.strip().splitlines():
+        foreign_languages_conf, sum_conf = 0, 0
+        try:
+            detection = Detector(line, quiet=True)
+        except Exception as e:
+            line = ''.join(x for x in line if x.isprintable())
+            detection = Detector(line, quiet=True)
+        for language in detection.languages:
+            if language.code not in ["ru", "un", "be", "sr", "uk"]:
+                foreign_languages_conf += language.confidence
+            sum_conf += language.confidence
+        if foreign_languages_conf > threshold:
+            have_code = True
+        else:
+            if not filter_unknown_language or sum_conf:
+                if all(stop_word not in line for stop_word in code_stop_words):
+                    result_text.append(line)
+    return "\n".join(result_text), have_code
+```
+
+Добавим в датасет измененные комментарии, значения позитива, негатива, нейтральности текста, а также количество восклицаний в тексте комментария:
+```{python}
+dataset[["Комментарий", "Neutral", "Positive", "Negative", "Exclamations"]] = dataset.apply(lambda x: preprocessing_text(x["Комментарий"]), axis=1, result_type="expand")
+```
+
+
+Добавим в датасет измененные комментарии и факт наличия кода в тексте:
+```{python}
+dataset[["Комментарий", "have_code"]] = dataset.apply(lambda x: filter_code(x["Комментарий"]), axis=1, result_type="expand")
+```
+
+Добавим в датасет значения позитива, негатива, нейтральности текста, полученные благодаря NLP:
+```{python}
+dataset[["Neutral_NLP", "Positive_NLP", "Negative_NLP", "Speech_NLP"]] = [[el["neutral"], el["positive"], el["negative"], el["speech"]] for el in sentiment_model.predict(dataset["Комментарий"], k=5)]
+```
+
+## Code Detection Analysis
+
+### Example Library lingua
+
+Попробовал библиотеку `lingua` для определения английского, но она так себе зарекомендовала на большинстве примеров:
+```{python}
+from lingua import Language, LanguageDetectorBuilder
+languages = [Language.ENGLISH, Language.FRENCH, Language.GERMAN, Language.SPANISH]
+detector = LanguageDetectorBuilder.from_languages(*languages).build()
+confidence_values = detector.compute_language_confidence_values("""Я попрактиковался более детально.
+ surname=input('Введите фамилию: ')
+ name=input(""Введите имя "")
+ print('Вас зовут - '+name,surname+'?')
+ c=input 
+ print('Приветствую Вас, '+name,surname+'.', ' Я - ваш компьютер.')""")
+for confidence in confidence_values:
+    print(f"{confidence.language.name}: {confidence.value:.2f}")
+```
+
+### Example Library polyglot
+А вот библиотека `polyglot` определяет более 100 языков, устойчива на маленьких текстах и отлично себя зарекомендовала:
+
+```{python}
+#| code-fold: true
+mixed_text = u"""минута time = 6:23
+
+именно так с (func, args и kwargs) ... а можно и не так : 
+
+ ссылка 
+
+ ссылка 
++++++++++++++++++++++++++++++
+
+from typing import Callable
+# ================================================================================
+
+
+def external_decorator :
+ def decorator(func):
+ def wrapper(*dec_args, **dec_kwargs):
+ print('\n\t0_Переданные в _ДЕКОРАТОР\t""арги"" и ""кварги"":\t', dec_args, dec_kwargs )
+ return func(*dec_args, **dec_kwargs)
+ return wrapper
+ return decorator
+
+# ================================================================================
+
+
+ 
+def internal_decorator(*dargs, **dkwargs) -> Callable:
+ print('\t1_Переданные в _ДЕКОРАТОР\t""арги"" и ""кварги"":\t', dargs, dkwargs )
+ def decorator(func):
+ print('\t2_Переданные в _ДЕКОРАТОР\t""арги"" и ""кварги"":\t', dargs, dkwargs)
+ def wrapper(*args, **kwargs):
+ print('\t3_Переданные в _ДЕКОРАТОР\t""арги"" и ""кварги"":\t', dargs, dkwargs)
+ print('\nПереданные в _ФУНКЦИЮ\t""арги"" и ""кварги"":\t', args, kwargs )
+ return func(*args, **kwargs)
+ return wrapper
+ return decorator
+
+# ================================================================================
+
+
+ (100, 'рублей', 200, 'друзей')
+def function(text: str, num: int) -> None:
+ print(""\n\tПрмвет"", text, num)
+
+# ================================================================================
+
+
+function(""Юзер"", 101)
+
+... повторюсь (коммент к блоку №16): декораторы объясняются формально (поверхностно). даже в пояснении к первой задаче декор1[декор2[функция(функ_парам)], дек1_парам.] итеративность упоминается вскользь, но не поясняется. 
+
+++++++++++++++++++++++++++++++++
+
+в одном из модулей 16 была задача с декорированием целого класса (логирование инициализации экземпляра) ... а в тесте была задача с декорированием модулей классов при наследовании классов B(A) ... так вот при таком наследовании декор всего класса не работает ... 
+ ссылка 
+(строка №52 - если раскомментировать )
+---------------------------------------------------------------------------
+TypeError Traceback (most recent call last)
+<ipython-input-2-301b33d13241> in <cell line: 63> 
+ 63 (""%Y-%m-%d %H:%M:%S"")
+ 64 (timer)
+---> 65 class B(A):
+ 66 def test_sum_1(self):
+ 67 print('xxxxxxxxxxxxxxxxx')
+TypeError: function argument 'code' must be code, not str
++++++++++++++++++++++++++++++++++++++++++
+ [декоратор(класс_B(декоратор(класс_А)))] - а из лекций это(почему не работает) понять сложно ... а в лекциях этот момент не рассматривается ( 
+шаг влево. шаг вправо и все ""сыпится"" , если пользоваться ""вашими декораторами"" - учебными материалами.(((("""
+mixed_text_preprocessing = u"""минута time = 6:23
+
+именно так с (func, args и kwargs) ... а можно и не так : 
+
+ ссылка 
+
+ ссылка 
++++++++++++++++++++++++++++++
+
+from typing import Callable
+# ================================================================================
+
+
+def external_decorator :
+ def decorator(func):
+ def wrapper(*dec_args, **dec_kwargs):
+ print('  0_Переданные в _ДЕКОРАТОР ""арги"" и ""кварги"": ', dec_args, dec_kwargs )
+ return func(*dec_args, **dec_kwargs)
+ return wrapper
+ return decorator
+
+# ================================================================================
+
+
+ 
+def internal_decorator(*dargs, **dkwargs) -> Callable:
+ print(' 1_Переданные в _ДЕКОРАТОР ""арги"" и ""кварги"": ', dargs, dkwargs )
+ def decorator(func):
+ print(' 2_Переданные в _ДЕКОРАТОР ""арги"" и ""кварги"": ', dargs, dkwargs)
+ def wrapper(*args, **kwargs):
+ print(' 3_Переданные в _ДЕКОРАТОР ""арги"" и ""кварги"": ', dargs, dkwargs)
+ print(' Переданные в _ФУНКЦИЮ ""арги"" и ""кварги"": ', args, kwargs )
+ return func(*args, **kwargs)
+ return wrapper
+ return decorator
+
+# ================================================================================
+
+
+ (100, 'рублей', 200, 'друзей')
+def function(text: str, num: int) -> None:
+ print(""  Прмвет"", text, num)
+
+# ================================================================================
+
+
+function(""Юзер"", 101)
+
+... повторюсь (коммент к блоку №16): декораторы объясняются формально (поверхностно). даже в пояснении к первой задаче декор1[декор2[функция(функ_парам)], дек1_парам.] итеративность упоминается вскользь, но не поясняется. 
+
+++++++++++++++++++++++++++++++++
+
+в одном из модулей 16 была задача с декорированием целого класса (логирование инициализации экземпляра) ... а в тесте была задача с декорированием модулей классов при наследовании классов B(A) ... так вот при таком наследовании декор всего класса не работает ... 
+ ссылка 
+(строка №52 - если раскомментировать )
+---------------------------------------------------------------------------
+TypeError Traceback (most recent call last)
+<ipython-input-2-301b33d13241> in <cell line: 63> 
+ 63 (""%Y-%m-%d %H:%M:%S"")
+ 64 (timer)
+---> 65 class B(A):
+ 66 def test_sum_1(self):
+ 67 print('xxxxxxxxxxxxxxxxx')
+TypeError: function argument 'code' must be code, not str
++++++++++++++++++++++++++++++++++++++++++
+ [декоратор(класс_B(декоратор(класс_А)))] - а из лекций это(почему не работает) понять сложно ... а в лекциях этот момент не рассматривается ( 
+шаг влево. шаг вправо и все ""сыпится"" , если пользоваться ""вашими декораторами"" - учебными материалами.(((("""
+for language in Detector(mixed_text, quiet=True).languages:
+  print(language)
+```
+
+Посмотрим на результат алгоритма фильтрации для текста без препроцессинга:
+```{python}
+#| echo: false
+
+print(filter_code(mixed_text)[0])
+```
+
+Теперь посмотрим на результат алгоритма фильтрации для текста с препроцессингом:
+```{python}
+#| echo: false
+
+print(filter_code(mixed_text_preprocessing)[0])
+```
+
+При этом алгоритм полностью устойчив для предложений с наличием английских слов:
+```{python}
+print(filter_code("""Здраствуйте. Hello World! 1. До этого я изучала языки программирование Unix, Windows, С и Python, немного верстку.
+2. Сейчас делаю тестовое задание для стажировки на php, решила немного узнать про основы.
+3. Материалы на английском присылать можно.""")[1])
+```
+
+Посмотрим на классовую разницу по наличию кода в текстах:
+```{python}
+#| echo: false
+
+dataset["have_code"].value_counts()
+```
+
+У нас большой дизбаланс в классах, так что поделим на количество семплов по каждому классу:
+```{python}
+#| echo: false
+
+groups_have_code = dataset.groupby("Категория")["have_code"].sum()
+data_have_code = {key: value / (dataset["Категория"] == key).sum() for key, value in groups_have_code.to_dict().items() if key in categories}
+ax = sns.barplot(x=data_have_code.keys(), y=data_have_code.values()) 
+ax.set (ylabel='Кол-во кода/кол-во семплов категории')
+```
+
+Хоть это не интуитивно понятно, но в классе `ДЗ` сравнимо меньше процент наличия кода в текстах, нежели у других классов. 
+
+**Выводы**: фильтрация отлично работает, следует использовать при обучении модели. Признак `have_code` тоже следует использовать, так как хорошо выделяет 3 кластера - (Видео, Лонгрид), (ДЗ), (Тест)
+
+## Text sentiment analysis
+У нас есть два типа признаков: \
+• Собранные с помощью анализатора эмодзи \
+• Полученные благодаря NLP-модели из библиотеки `dostoevsky` \
+
+### NLP
+Для понимания рентабельности этих фич удобно использовать график `boxplot`:
+
+```{python}
+#| echo: false
+sns.boxplot(data=dataset, x="Neutral_NLP", y="Категория")
+```
+Неплохой признак для простраивания различий между классами, видно их квартили сильно различаются. А наличие выбросов так совсем.
+
+```{python}
+#| echo: false
+
+sns.boxplot(data=dataset, x="Positive_NLP", y="Категория")
+```
+Здесь уже менее интересные наблюдения, статистически классы похожи, однако ситуацию меняют выбросы в положительную сторону `Positive` - у последних 3ых классов они около нулевые. Полагаю эти классы нужны для сбора негативного фидбека.  
+
+```{python}
+#| echo: false
+
+sns.boxplot(data=dataset, x="Negative_NLP", y="Категория")
+```
+
+```{python}
+#| echo: false
+
+sns.barplot(data=dataset, x="Negative_NLP", y="Категория")
+```
+Как и полагалось, статистически последние 3 класса более негативные, нежели остальные классы.
+
+```{python}
+#| echo: false
+
+sns.boxplot(data=dataset, x="Speech_NLP", y="Категория")
+```
+
+```{python}
+#| echo: false
+
+sns.barplot(data=dataset, x="Speech_NLP", y="Категория")
+```
+А вот здесь крайне необычное наблюдение! Видимо в классе `ДЗ` преобладают текста с наличием прямой или косвенной речи.
+
+**Выводы**: Перечисленные признаки кажутся очень информативными для модели, точно следует их использовать во время обучения.
+
+### Emoji
+Для понимания рентабельности этих фич удобно использовать столбчатую диаграмму:
+
+```{python}
+#| echo: false
+
+sns.barplot(data=dataset, x="Neutral", y="Категория")
+```
+
+```{python}
+#| echo: false
+
+sns.barplot(data=dataset, x="Positive", y="Категория")
+```
+
+```{python}
+#| echo: false
+
+sns.barplot(data=dataset, x="Negative", y="Категория")
+```
+
+```{python}
+#| echo: false
+
+sns.barplot(data=dataset, x="Exclamations", y="Категория")
+```
+
+**Выводы**: Относительно NLP-шных признаков, эти кажутся совсем бесполезными. Но думаю, что всё равно стоит прогнать обучение моделей и на них.
+
+## Аугментация
+
+В данном датасете не виден смысл использования Downsampling по причине нехватки данных у большинства классов, Upsampling здесь куда более перспективен. Но несмотря на его преимущества, один факт ставит это под сомнение - 2 категории измеряются тысячами, другие 2 категории десятками тысяч. \\
+Говоря о аугментации, то естественно хотим привести все категории к 23 000 семплам, как у категории "ДЗ", для этого рассматривались две технологии: \
+ • [Парафразер, разработанный на базе ruT5](https://huggingface.co/cointegrated/rut5-base-paraphraser). Подобное решение казалось хорошим, однако по итогу был виден некачественный результат на длинных текстах (более 2 предложений), а также низкую дисперсию сгенерированных текстов. \
+ • ruGPT3-medium с файнтюнингом на 4000 семплах. Визуально кажется хорошим вариантом дл аугментации данных, однако при генерации несколько десятков тысяч на одну категорию, всё равно приходим к низкой дисперсии текстов. В этом решении вижу другую альтернативу - уравнять классы "ДЗ" и "Видео", а "Лонгрид" с "Тест" до 3-4 тысяч. А для дальнейшей классификации использовать FocalLoss или параметры для устранения дизбаланса.
+
+### ruGPT3-medium в качестве аугментации данных
+
+Для начала посмотрим на распределение длины отфильтрованных данных, чтобы выставить параметры генерации:
+```{python}
+#| echo: false
+
+lengths = [len(el) for el in dataset["Комментарий"]]
+pd.Series(lengths).describe()
+```
+
+```{python}
+#| echo: false
+
+sns.displot(lengths, bins=100)
+```
+
+Теперь посмотрим ту же информацию по классам.
+Категория "ДЗ":
+```{python}
+#| echo: false
+
+sns.displot([len(el) for el in dataset[dataset["Категория"] == "ДЗ"]["Комментарий"]], bins=100)
+```
+
+Категория "Видео":
+```{python}
+#| echo: false
+
+sns.displot([len(el) for el in dataset[dataset["Категория"] == "Видео"]["Комментарий"]], bins=100)
+```
+
+Категория "Тест":
+```{python}
+#| echo: false
+
+sns.displot([len(el) for el in dataset[dataset["Категория"] == "Тест"]["Комментарий"]], bins=100)
+```
+
+Категория "Лонгрид":
+```{python}
+#| echo: false
+
+sns.displot([len(el) for el in dataset[dataset["Категория"] == "Лонгрид"]["Комментарий"]], bins=100)
+```
+
+Исходя из распределений, можно зафиксировать максимальную длину 512 для генерации. Для обучения ruGPT3 понадобиться препроцессинг с добавлением спец. токенов:
+```{python}
+def convert(unit):
+    category, text = unit["Категория"], unit["Комментарий"]
+    if category == "ДЗ":
+        category = "Домашнее задание"
+    elif category == "Лонгрид":
+        category = "Обзор, лонгрид, long read"
+    text = re.sub(r'\s+', ' ', text)
+    text = f"<s>Тема сообщения на платформе Skillbox: {category}\n{text}</s>"
+    return text
+```
+Подготовим выборку для обучения ruGPT3:
+```{python}
+aug_data = dataset[(dataset["Категория"].isin(['Видео', 'ДЗ', 'Лонгрид', 'Тест'])) & (dataset["Комментарий"].notna())]
+train = aug_data.groupby('Категория', group_keys=False).apply(lambda x: x.sample(1000))
+train = train.sample(frac=1)
+train_data = list(train[["Категория", "Комментарий"]].apply(convert, axis=1))
+with open("train.txt", "w", encoding="utf-8") as file:
+    file.write("\n".join(train_data))
+```
+
+Воспользуемся [файлом для обучения gpt](https://raw.githubusercontent.com/buvanenko/finetune_rugpt3/main/pretrain_transformers.py), предоставленным Сбером:
+```{console}
+python pretrain_transformers.py \
+    --output_dir=essays_model \
+    --model_type=gpt2 \
+    --model_name_or_path=sberbank-ai/rugpt3medium_based_on_gpt2 \
+    --do_train \
+    --train_data_file=train.txt \
+    --fp16 \
+    --per_gpu_train_batch_size 1 \
+    --gradient_accumulation_steps 1 \
+    --num_train_epochs 5 \
+    --block_size 2048 \
+    --overwrite_output_dir
+```
+
+## Выводы
+
+1. Данные очень противоречивы, при классификации точно потребуется полагаться не только на эмбединги и статистику слов. Стоит учитывать имена, обращения, эмоциональность, тональность текста. 
+2. У данных огромный дизбаланс из-за которого downsampling и upsampling скорее всего приведут к негативному результату. Однако сразу очевидно, что стоит использовать параметры устранения дизбаланса, регуляризацию и FocalLoss.
+3. Стоит убрать категории 'Качество материалов', 'Общение с куратором', 'Интерфейс платформы' из-за отсутствия данных для обучения.
+4. Из эмодзи и восклицаний взята хорошая статистика о тональности текста. Это уже 4 дополнительных признака, вполне возможно взять еще один на основе анализа тональности bert deeppalov.
