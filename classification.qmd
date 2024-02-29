@@ -1,26 +1,18 @@
-# Отчет по обучению Bert с FocalLoss
+# Отчет по классификации
 
 
 ```{python}
 import re
-import torch
+import eli5
 import nltk
 import emoji
 import emosent
-import pyarrow
-import nbformat
-from torch import nn
 import polars as pl
 import pandas as pd
 import numpy as np
 import warnings
 import seaborn as sns
 from typing import Any
-from datasets import Dataset
-from functools import partial
-import plotly.figure_factory as ff
-import torch.nn.functional as F
-from torch.autograd import Variable
 from nltk.corpus import stopwords
 from string import punctuation as PUNCT
 from datasets import load_dataset, Dataset
@@ -28,12 +20,12 @@ from dostoevsky.tokenization import RegexTokenizer
 from dostoevsky.models import FastTextSocialNetworkModel
 from polyglot.detect import Detector
 from polyglot.detect.base import logger as polyglot_logger
-
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from transformers import (
     AutoTokenizer,
+    BertForSequenceClassification,
     AutoModelForSequenceClassification,
-    BertForSequenceClassification
     TrainingArguments,
     Trainer,
     EvalPrediction,
@@ -50,13 +42,21 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
+import torch
+from torch import nn
 import matplotlib.pyplot as plt
+from functools import partial
 from sklearn.utils.class_weight import compute_class_weight
+from typing import Any
+import plotly.figure_factory as ff
 ```
 
+Стоит фильтровать стоп-слова русского языка для использования TF-IDF как дополнительного признака в модель:
 ```{python}
 warnings.filterwarnings("ignore")
 polyglot_logger.setLevel("ERROR")
+nltk.download("stopwords")
+RUSSIAN_STOPWORDS = set(stopwords.words("russian"))
 ```
 
 ```{python}
@@ -153,7 +153,9 @@ def filter_code(text: str, filter_unknown_language=True) -> bool:
             if not filter_unknown_language or sum_conf:
                 if all(stop_word not in line for stop_word in code_stop_words):
                     result_text.append(line)
-    return "\n".join(result_text), have_code
+    if have_code:
+        return "\n".join(result_text), have_code
+    return text, have_code
 ```
 
 ```{python}
@@ -193,6 +195,11 @@ dataset[["Комментарий", "have_code"]] = dataset.apply(lambda x: filte
 Добавим в датасет значения позитива, негатива, нейтральности текста, полученные благодаря NLP:
 ```{python}
 dataset[["Neutral_NLP", "Positive_NLP", "Negative_NLP", "Speech_NLP"]] = [[el["neutral"], el["positive"], el["negative"], el["speech"]] for el in sentiment_model.predict(dataset["Комментарий"], k=5)]
+```
+
+
+```{python}
+dataset = dataset[dataset["Комментарий"] != ""]
 ```
 
 ## Bert Training 
@@ -529,31 +536,27 @@ label2id = dict(zip(label2id, range(len(label2id))))
 id2label = {v: k for k, v in label2id.items()}
 ```
 
-```{python}
+```{{python}}
 #| code-fold: true
 
 train_ds, test_ds = make_dataset(t, tokenizer, label2id, TEST_SIZE)
 ```
 
-```{python}
+```{{python}}
 #| code-fold: true
 
 trainer = make_training_pipeline("category_classification", tokenizer, train_ds, test_ds, batch_size=BATCH_SIZE, epochs_num=EPOCHS)
 trainer.train()
 ```
 
-```{python}
+```{{python}}
 preds = trainer.predict(test_ds)
 preds
 ```
 
-```{python}
-trainer.save_model("focalbert")
-```
-
 ## Bert Validation 
 
-```{python}
+```{{python}}
 preds = trainer.predict(test_ds)
 pred_labels = np.apply_along_axis(predict, 1, preds[0])
 pred_labels = [id2label[x] for x in pred_labels]
@@ -565,7 +568,7 @@ print(cr)
 cm = confusion_matrix(gt_labels, pred_labels, labels=list(label2id.keys()))
 ```
 
-```{python}
+```{{python}}
 #| code-fold: true
 
 x = list(label2id.keys())
@@ -595,4 +598,105 @@ fig.add_annotation(
 
 fig["data"][0]["showscale"] = True
 fig.show()
+```
+
+## Meta Model Training 
+В качестве мета модели будем использовать `Random Forest` с призанками:\
+ • 4 вероятности с выхода модели `BERT`\
+ • have_code - есть ли код в комментарии\
+ • One hot encoding по "Направление" и "Факультет"\
+ • Оценка\
+ • 4 признаков NLP тональности текста\
+ • 4 признака тональности текста по эмодзи и восклицанию\
+
+
+Загрузим предсказания обученного `BERT` для всей выборки
+```{python}
+bert_preds = pd.DataFrame(np.loadtxt("all_preds.txt"))
+```
+
+```{python}
+meta_dataset_pl = t.select(pl.exclude("ID студента", "Тег", "Комментарий", "Статус"))
+meta_dataset_pl
+```
+
+
+Объединим все данные и сделаем One hot encoding для "Направление" и "Факультет"
+```{python}
+directions = pd.get_dummies(meta_dataset_pl.to_pandas()["Направление"])
+departments = pd.get_dummies(meta_dataset_pl.to_pandas()["Факультет"])
+meta_dataset = meta_dataset_pl.select(pl.exclude("Направление", "Факультет")).to_pandas()
+meta_dataset = pd.concat([meta_dataset, directions, departments, bert_preds], axis=1)
+meta_dataset["Категория"] = [label2id[el] for el in meta_dataset["Категория"]]
+meta_dataset.columns = meta_dataset.columns.astype(str)
+```
+
+```{python}
+train_df, test_df = train_test_split(meta_dataset, test_size=0.2, random_state=42, stratify=meta_dataset["Категория"],
+)
+X_train, y_train = train_df.loc[:, train_df.columns != 'Категория'], train_df["Категория"]
+X_test, y_test = test_df.loc[:, test_df.columns != 'Категория'], test_df["Категория"]
+```
+
+По опыту такой набор параметров - лучший результат для мета модели
+```{python}
+model = RandomForestClassifier(max_depth=10, criterion="gini", n_estimators=150, class_weight="balanced")
+```
+
+
+```{python}
+model.fit(X=X_train, y=y_train)
+```
+
+```{python}
+pred_labels = model.predict(X=X_test)
+gt_labels = y_test.values
+pred_labels = [id2label[x] for x in pred_labels]
+gt_labels = [id2label[x] for x in gt_labels]
+```
+
+```{python}
+cr = classification_report(gt_labels, pred_labels, output_dict=True)
+cr = pd.DataFrame(cr).T
+print(cr)
+
+cm = confusion_matrix(gt_labels, pred_labels, labels=list(label2id.keys()))
+```
+
+```{python}
+#| code-fold: true
+x = list(label2id.keys())
+y = list(reversed(label2id.keys()))
+fig = ff.create_annotated_heatmap(np.flipud(cm), x=x, y=y, colorscale="Viridis")
+fig.update_layout(title_text="Confusion matrix")
+fig.add_annotation(
+    dict(
+        x=0.5,
+        y=-0.15,
+        showarrow=False,
+        text="Predicted value",
+        xref="paper",
+        yref="paper",
+    )
+)
+
+fig.add_annotation(
+    dict(
+        x=-0.16,
+        y=0.5,
+        showarrow=False,
+        text="Real value",
+        textangle=-90,
+        xref="paper",
+        yref="paper",
+    )
+)
+
+fig["data"][0]["showscale"] = True
+fig.show()
+```
+
+Теперь посмотрим на вклад каждого признака в мета модель:
+```{python}
+eli5.explain_weights(model, target_names=id2label, feature_names=X_train.columns.values)
 ```
