@@ -1,0 +1,702 @@
+# Отчет по классификации
+
+
+```{python}
+import re
+import eli5
+import nltk
+import emoji
+import emosent
+import polars as pl
+import pandas as pd
+import numpy as np
+import warnings
+import seaborn as sns
+from typing import Any
+from nltk.corpus import stopwords
+from string import punctuation as PUNCT
+from datasets import load_dataset, Dataset
+from dostoevsky.tokenization import RegexTokenizer
+from dostoevsky.models import FastTextSocialNetworkModel
+from polyglot.detect import Detector
+from polyglot.detect.base import logger as polyglot_logger
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from transformers import (
+    AutoTokenizer,
+    BertForSequenceClassification,
+    AutoModelForSequenceClassification,
+    TrainingArguments,
+    Trainer,
+    EvalPrediction,
+    EarlyStoppingCallback,
+)
+from sklearn.metrics import (
+    f1_score,
+    roc_auc_score,
+    accuracy_score,
+    multilabel_confusion_matrix,
+    confusion_matrix,
+    ConfusionMatrixDisplay,
+    classification_report,
+    precision_score,
+    recall_score,
+)
+import torch
+from torch import nn
+import matplotlib.pyplot as plt
+from functools import partial
+from sklearn.utils.class_weight import compute_class_weight
+from typing import Any
+import plotly.figure_factory as ff
+```
+
+Стоит фильтровать стоп-слова русского языка для использования TF-IDF как дополнительного признака в модель:
+```{python}
+warnings.filterwarnings("ignore")
+polyglot_logger.setLevel("ERROR")
+nltk.download("stopwords")
+RUSSIAN_STOPWORDS = set(stopwords.words("russian"))
+```
+
+```{python}
+sentiment_tokenizer = RegexTokenizer()
+sentiment_model = FastTextSocialNetworkModel(tokenizer=sentiment_tokenizer)
+```
+
+## Датасет
+
+```{python}
+dataset = pd.read_csv("practice_cleaned.csv")
+dataset.head()
+```
+
+```{python}
+categories = ['Видео', 'ДЗ', 'Лонгрид', 'Тест']
+```
+
+## Preprocessing
+
+После зрительного просмотра данных были найдены такие дефекты, как: \
+ • Вместо ссылок в комментариях указано "ССЫЛКА". Было решено оставить с пониженным регистром, чтобы не мешать для будущих алгоритмов, например NER. По логике ссылки чаще всего встречаются в категории "Видео". \
+ • В комментариях часто упоминаются эмодзи, причем нескольких видов. Это как текстовые, например, ":)", это реальные эмодзи, к примеру, "😊", а также подобные этим "♥". Во-первых они все фильтруются для LLM, во-вторых из них изымается позитивность, негативность и нейтральность текста. \
+ • Также в тексте не редко можно увидеть восклицания - это тоже важная информация для понимания тональности текста. Количество восклицаний добавляется как еще один признак.
+ • В комментариях иногда попадаются куски кода, не редко видны ошибки. Так же попадаются ссылки на Telegram и другие соц.сети. По этим причинам фильтруются все возможные теги, все возможные пути, как абсолютные, так и относительные. \
+ • Пользователи выделяют некоторые слова кавычками, которые по итогу преобразуются в несколько кавычек подряд (2 и более), поэтому всё приводится к нормальному виду одной кавычки.\
+
+Одна из основных проблем данных - наличие кода на разных языках программирования. В основном язык коментариев - русский, при этом языки программирования оперируют английским. Лаконичное решение фильтрации текста - воспользоваться моделями для детектирования языков, тем самым детектируя наличие кода:
+
+ • Во-первых будем проходить текст по предложениям, предсказывая множество языков в каждом предложении \
+ • Во-вторых заметим, что русский относится к славянским языкам, так что детектор может рассматривать их вместо него \
+ • В-третьих поставим порог по инославянским языкам - 30% текста, для определения является ли предложение кодом \
+ • В-четвертых будем удалять предложения в которых стоп слова - "input", "print" и т.д.\
+
+```{python}
+test_smiles = [":\)", ":\^\)", ":\(", "=\)", ":o\)",
+               ":D", "=D", ":-/", ":/", ":P", "=]",
+               ":-р", "8\)", "=O", ":-o", "X-\)",
+               "\^_\^", "o_O", "\$_\$", "\^o\^",
+               "\^3\^", "\*-\*", "<3", "\^3", ":\^\)"]
+
+def preprocessing_text(text):
+  neutral, positive, negative = 0, 0, 0
+  emojis = emosent.get_emoji_sentiment_rank_multiple(text)
+  amount_emojis = len(emojis)
+  if amount_emojis:
+    for emoji_symbol in emojis:
+      emoji_rank = emoji_symbol["emoji_sentiment_rank"]
+      positive += emoji_rank["positive"]
+      neutral += emoji_rank["neutral"]
+      negative += emoji_rank["negative"]
+    neutral, positive, negative = neutral / amount_emojis, positive / amount_emojis, negative / amount_emojis
+  text = emoji.replace_emoji(text, replace=' ')
+  text = re.sub(fr"{'|'.join(test_smiles)}", ' ', text)
+  text = re.sub(r'@[_A-Za-z0-9/\\-]+', ' ', text)
+  text = re.sub(r'C:\\{1,2}\S+\.\S+', ' ', text)
+  text = re.sub(r'[~_A-Za-z0-9-]+/[~_A-Za-z0-9-/.]+\.[~_A-Za-z0-9-\.]+', ' ', text)
+  text = re.sub(r'/[~_A-Za-z0-9-]+/[~_A-Za-z0-9-/][,:]?', ' ', text)
+  text = re.sub(r'\([^\S\n]*\)', ' ', text)
+  text = re.sub(r'"{2,4}', '"', text)
+  text = re.sub("[^\S\n]+", " ", text)
+  text = re.sub("ССЫЛКА", 'ссылка', text)
+  text = rf"{text}"
+  text = re.sub(r"\\n", " ", text)
+  text = re.sub(r"\\t", " ", text)
+  text = text.strip()
+  amount_exclamations = 0
+  for symbol in text:
+    if symbol == "!":
+      amount_exclamations += 1
+  return text, neutral, positive, negative, amount_exclamations
+```
+
+```{python}
+def filter_code(text: str, filter_unknown_language=True) -> bool:
+    code_stop_words = ["input", "print", "cin", "cout"]
+    threshold = 30
+    result_text = []
+    have_code = False
+    for line in text.strip().splitlines():
+        foreign_languages_conf, sum_conf = 0, 0
+        try:
+            detection = Detector(line, quiet=True)
+        except Exception as e:
+            line = ''.join(x for x in line if x.isprintable())
+            detection = Detector(line, quiet=True)
+        for language in detection.languages:
+            if language.code not in ["ru", "un", "be", "sr", "uk"]:
+                foreign_languages_conf += language.confidence
+            sum_conf += language.confidence
+        if foreign_languages_conf > threshold:
+            have_code = True
+        else:
+            if not filter_unknown_language or sum_conf:
+                if all(stop_word not in line for stop_word in code_stop_words):
+                    result_text.append(line)
+    if have_code:
+        return "\n".join(result_text), have_code
+    return text, have_code
+```
+
+```{python}
+#| code-fold: true
+
+def preprocess_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    """Filter out empty comments and comments from small categs.
+
+    Args:
+        frame (pl.DataFrame): input raw frame.
+
+    Returns:
+        pl.DataFrame: clear processed frame.
+    """
+    original_shape = frame.shape
+    frame = frame.filter(
+        ~pl.col("Категория").is_in(
+            ["Качество материалов", "Интерфейс платформы", "Общение с куратором"]
+        )
+    )
+    frame = frame.filter(~(pl.col("Комментарий").is_null()))
+    print(f"Empty comments & Category filtering: {original_shape} -> {frame.shape}")
+    return frame
+```
+
+Добавим в датасет измененные комментарии, значения позитива, негатива, нейтральности текста, а также количество восклицаний в тексте комментария:
+```{python}
+dataset[["Комментарий", "Neutral", "Positive", "Negative", "Exclamations"]] = dataset.apply(lambda x: preprocessing_text(x["Комментарий"]), axis=1, result_type="expand")
+```
+
+
+Добавим в датасет измененные комментарии и факт наличия кода в тексте:
+```{python}
+dataset[["Комментарий", "have_code"]] = dataset.apply(lambda x: filter_code(x["Комментарий"]), axis=1, result_type="expand")
+```
+
+Добавим в датасет значения позитива, негатива, нейтральности текста, полученные благодаря NLP:
+```{python}
+dataset[["Neutral_NLP", "Positive_NLP", "Negative_NLP", "Speech_NLP"]] = [[el["neutral"], el["positive"], el["negative"], el["speech"]] for el in sentiment_model.predict(dataset["Комментарий"], k=5)]
+```
+
+
+```{python}
+dataset = dataset[dataset["Комментарий"] != ""]
+```
+
+## Bert Training 
+Для обучения `BERT` модели с использованием фреймворков от `huggingface` необходимо проделать следующие шаги:\
+
+
+ • Перейти от исходных сырых данных в формате `.csv` к набору тензоров, содержащем в себе токенизированные тексты и метки классов (категорий). Это выполняют функции `preprocess_sample()` и `make_dataset()`\
+ • Определить модель, токенизатор и основные параметры обучения. Эти действия происходят в `make_training_pipeline()`\
+ • Определить функции для вычисления метрик на валидационных итерациях обучения - `compute_metrics()`\
+ • Определить Focal Loss для обучения модели с большим дизбалансом классов\
+
+
+```{python}
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=0, alpha=None, size_average=True):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        if isinstance(alpha,(float,int)): self.alpha = torch.Tensor([alpha,1-alpha])
+        if isinstance(alpha,list): self.alpha = torch.Tensor(alpha)
+        self.size_average = size_average
+
+    def forward(self, input, target):
+        if input.dim()>2:
+            input = input.view(input.size(0),input.size(1),-1)  # N,C,H,W => N,C,H*W
+            input = input.transpose(1,2)    # N,C,H*W => N,H*W,C
+            input = input.contiguous().view(-1,input.size(2))   # N,H*W,C => N*H*W,C
+        target = target.view(-1,1)
+
+        logpt = F.log_softmax(input)
+        logpt = logpt.gather(1,target)
+        logpt = logpt.view(-1)
+        pt = Variable(logpt.data.exp())
+
+        if self.alpha is not None:
+            if self.alpha.type()!=input.data.type():
+                self.alpha = self.alpha.type_as(input.data)
+            at = self.alpha.gather(0,target.data.view(-1))
+            logpt = logpt * Variable(at)
+
+        loss = -1 * (1-pt)**self.gamma * logpt
+        if self.size_average: return loss.mean()
+        else: return loss.sum()
+```
+
+```{python}
+class FocalBert(BertForSequenceClassification):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        token_type_ids=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        labels=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.bert(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        pooled_output = outputs[1]
+
+        pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(pooled_output)
+
+        loss = None
+        if labels is not None:
+            if self.config.problem_type is None:
+                if self.num_labels == 1:
+                    self.config.problem_type = "regression"
+                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
+                    self.config.problem_type = "single_label_classification"
+                else:
+                    self.config.problem_type = "multi_label_classification"
+
+            if self.config.problem_type == "regression":
+                loss_fct = nn.MSELoss()
+                if self.num_labels == 1:
+                    loss = loss_fct(logits.squeeze(), labels.squeeze())
+                else:
+                    loss = loss_fct(logits, labels)
+            elif self.config.problem_type == "single_label_classification":
+                loss_fct = FocalLoss()
+                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            elif self.config.problem_type == "multi_label_classification":
+                loss_fct = nn.BCEWithLogitsLoss()
+                loss = loss_fct(logits, labels)
+        if not return_dict:
+            output = (logits,) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
+
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+```
+
+```{python}
+#| code-fold: true
+
+def preprocess_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    """Filter out empty comments and comments from small categs.
+
+    Args:
+        frame (pl.DataFrame): input raw frame.
+
+    Returns:
+        pl.DataFrame: clear processed frame.
+    """
+    original_shape = frame.shape
+    frame = frame.filter(
+        ~pl.col("Категория").is_in(
+            ["Качество материалов", "Интерфейс платформы", "Общение с куратором"]
+        )
+    )
+    frame = frame.filter(~(pl.col("Комментарий").is_null()))
+    print(f"Empty comments & Category filtering: {original_shape} -> {frame.shape}")
+    return frame
+```
+
+
+```{python}
+#| code-fold: true
+
+def preprocess_sample(
+    sample: dict[str, Any], tokenizer: AutoTokenizer
+) -> dict[str, Any]:
+    """Encode input raw string to sequence of tokens.
+    Also add corresponding labels.
+
+    Args:
+        sample (dict[str, Any]): dataset sample w/ <text-label> pair
+        tokenizer (AutoTokenizer): model tokenizer
+
+    Returns:
+        dict[str, Any]: transformed sample with tokenized text and labels.
+    """
+    text = sample["text"]
+    # каждый сэмпл паддится до самой длинной посл-ти в этом батче (padding="max_length")
+    # макс. длина посл-ти 512 (max_length=512), все, что длиннее, обрезается (truncation=True)
+    encoding = tokenizer(text, padding="max_length", truncation=True, max_length=512)
+    encoding["labels"] = sample["labels"]
+    return encoding
+```
+
+```{python}
+#| code-fold: true
+#| 
+def compute_metrics(p: EvalPrediction) -> dict[str, float]:
+    """Calculate metrics used on validation step.
+
+    Args:
+        p (EvalPrediction): container with predictions and
+        ground-truth labels
+
+    Returns:
+        dict[str, float]: dictionary with computed labels
+    """
+    preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
+    preds = np.argmax(preds, axis=1)
+    f1 = f1_score(p.label_ids, preds, average="macro")
+    acc = accuracy_score(p.label_ids, preds)
+    res = {"f1": f1, "accuracy": acc}
+    return res
+```
+
+
+```{python}
+#| code-fold: true
+
+def make_dataset(
+    frame: pl.DataFrame,
+    tokenizer: AutoTokenizer,
+    label2id: dict[str, int],
+    test_size: float = None,
+) -> tuple[Dataset, Dataset]:
+    """Create huggingface datasets used in training process.
+
+    Args:
+        frame (pl.DataFrame): input frame with text data
+        tokenizer (AutoTokenizer): model tokenizer
+        label2id (dict[str, int]): mapping from category text names
+        to digital ids.
+        test_size (float, optional): test split share. Defaults to None.
+
+    Returns:
+        tuple[Dataset, Dataset]: train & test splits, tokenized, vectorized and batched.
+    """
+    # переименуем столбцы для целостности с api hf-datasets
+    clear_frame = frame.select(
+        pl.col("Комментарий").alias("text"), pl.col("Категория").alias("labels")
+    )  
+
+    # перейдем от строковых названий к численным меткам
+    clear_frame = clear_frame.with_columns(pl.col("labels").map_dict(label2id))  
+
+    # каррированная функция с фиксированным токенизатором для дальнейшего исп-я в Dataset.map()
+    part_prepr = partial(preprocess_sample, tokenizer=tokenizer)
+
+    train_df, test_df = train_test_split(
+        clear_frame,
+        test_size=test_size,
+        random_state=42,
+        stratify=clear_frame["labels"],
+    )
+    train_dataset = Dataset.from_pandas(train_df.to_pandas(), split="train")
+    test_dataset = Dataset.from_pandas(test_df.to_pandas(), split="test")
+    encoded_train = train_dataset.map(
+        part_prepr, batched=True, remove_columns=train_dataset.column_names
+    )
+    encoded_test = test_dataset.map(
+        part_prepr, batched=True, remove_columns=test_dataset.column_names
+    )
+    encoded_train.set_format("torch")
+    encoded_test.set_format("torch")
+    return encoded_train, encoded_test
+```
+
+```{python}
+#| code-fold: true
+
+def make_training_pipeline(
+    exp_name: str,
+    tokenizer: AutoTokenizer,
+    train_dataset: Dataset,
+    eval_dataset: Dataset,
+    batch_size: int = 32,
+    lr: float = 2e-5,
+    epochs_num: int = 20,
+) -> Trainer:
+    """Training process wrapper.
+
+    Args:
+        exp_name (str): name of the local folder
+        for saving model checkpoints.
+        tokenizer (AutoTokenizer): model tokenizer
+        train_dataset (Dataset): train dataset split
+        eval_dataset (Dataset): test dataset split
+        batch_size (int, optional): number of samples
+        in sigle batch. Defaults to 32.
+        lr (float, optional): model's learning rate. Defaults to 2e-5.
+        epochs_num (int, optional):
+        number of training iterations. Defaults to 20.
+
+    Returns:
+        Trainer: hf training pipeline abstraction class.
+    """
+    args = TrainingArguments(
+        exp_name,
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        learning_rate=lr,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        num_train_epochs=epochs_num,
+        weight_decay=0.01,
+        load_best_model_at_end=True,
+        metric_for_best_model="f1",
+        fp16=True,
+    )
+
+    model = FocalBert.from_pretrained(
+        "cointegrated/rubert-tiny2",
+        problem_type="single_label_classification",
+        num_labels=len(id2label),
+        id2label=id2label,
+        label2id=label2id,
+    )
+
+    trainer = Trainer(
+        model,
+        args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        tokenizer=tokenizer,
+        compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
+    )
+    return trainer
+```
+
+```{python}
+#| code-fold: true
+
+def predict(logits: torch.Tensor) -> np.ndarray:
+    s = torch.nn.Softmax()
+    probs = s(torch.tensor(logits))
+    return np.argmax(probs)
+```
+
+Начнем обучение `BERT` модели:
+
+```{python}
+BATCH_SIZE = 100
+EPOCHS = 20
+TEST_SIZE = 0.2
+```
+
+```{python}
+#| code-fold: true
+
+dataset_polars = pl.from_dataframe(dataset)
+tokenizer = AutoTokenizer.from_pretrained("cointegrated/rubert-tiny2")
+t = preprocess_frame(dataset_polars)
+print(t["Категория"].value_counts(sort=True))
+label2id = t["Категория"].unique().sort().to_list()
+label2id = dict(zip(label2id, range(len(label2id))))
+id2label = {v: k for k, v in label2id.items()}
+```
+
+```{{python}}
+#| code-fold: true
+
+train_ds, test_ds = make_dataset(t, tokenizer, label2id, TEST_SIZE)
+```
+
+```{{python}}
+#| code-fold: true
+
+trainer = make_training_pipeline("category_classification", tokenizer, train_ds, test_ds, batch_size=BATCH_SIZE, epochs_num=EPOCHS)
+trainer.train()
+```
+
+```{{python}}
+preds = trainer.predict(test_ds)
+preds
+```
+
+## Bert Validation 
+
+```{{python}}
+preds = trainer.predict(test_ds)
+pred_labels = np.apply_along_axis(predict, 1, preds[0])
+pred_labels = [id2label[x] for x in pred_labels]
+gt_labels = [id2label[x] for x in preds[1]]
+cr = classification_report(gt_labels, pred_labels, output_dict=True)
+cr = pd.DataFrame(cr).T
+print(cr)
+
+cm = confusion_matrix(gt_labels, pred_labels, labels=list(label2id.keys()))
+```
+
+```{{python}}
+#| code-fold: true
+
+x = list(label2id.keys())
+y = list(reversed(label2id.keys()))
+fig = ff.create_annotated_heatmap(np.flipud(cm), x=x, y=y, colorscale="Viridis")
+fig.update_layout(title_text="Confusion matrix")
+fig.add_annotation(
+    dict(
+        x=0.5,save_model
+        text="Predicted value",
+        xref="paper",
+        yref="paper",
+    )
+)
+
+fig.add_annotation(
+    dict(
+        x=-0.16,
+        y=0.5,
+        showarrow=False,
+        text="Real value",
+        textangle=-90,
+        xref="paper",
+        yref="paper",
+    )
+)
+
+fig["data"][0]["showscale"] = True
+fig.show()
+```
+
+## Meta Model Training 
+В качестве мета модели будем использовать `Random Forest` с призанками:\
+ • 4 вероятности с выхода модели `BERT`\
+ • have_code - есть ли код в комментарии\
+ • One hot encoding по "Направление" и "Факультет"\
+ • Оценка\
+ • 4 признаков NLP тональности текста\
+ • 4 признака тональности текста по эмодзи и восклицанию\
+
+
+Загрузим предсказания обученного `BERT` для всей выборки
+```{python}
+bert_preds = pd.DataFrame(np.loadtxt("all_preds.txt"))
+```
+
+```{python}
+meta_dataset_pl = t.select(pl.exclude("ID студента", "Тег", "Комментарий", "Статус"))
+meta_dataset_pl
+```
+
+
+Объединим все данные и сделаем One hot encoding для "Направление" и "Факультет"
+```{python}
+directions = pd.get_dummies(meta_dataset_pl.to_pandas()["Направление"])
+departments = pd.get_dummies(meta_dataset_pl.to_pandas()["Факультет"])
+meta_dataset = meta_dataset_pl.select(pl.exclude("Направление", "Факультет")).to_pandas()
+meta_dataset = pd.concat([meta_dataset, directions, departments, bert_preds], axis=1)
+meta_dataset["Категория"] = [label2id[el] for el in meta_dataset["Категория"]]
+meta_dataset.columns = meta_dataset.columns.astype(str)
+```
+
+```{python}
+train_df, test_df = train_test_split(meta_dataset, test_size=0.2, random_state=42, stratify=meta_dataset["Категория"],
+)
+X_train, y_train = train_df.loc[:, train_df.columns != 'Категория'], train_df["Категория"]
+X_test, y_test = test_df.loc[:, test_df.columns != 'Категория'], test_df["Категория"]
+```
+
+По опыту такой набор параметров - лучший результат для мета модели
+```{python}
+model = RandomForestClassifier(max_depth=10, criterion="gini", n_estimators=150, class_weight="balanced")
+```
+
+
+```{python}
+model.fit(X=X_train, y=y_train)
+```
+
+```{python}
+pred_labels = model.predict(X=X_test)
+gt_labels = y_test.values
+pred_labels = [id2label[x] for x in pred_labels]
+gt_labels = [id2label[x] for x in gt_labels]
+```
+
+```{python}
+cr = classification_report(gt_labels, pred_labels, output_dict=True)
+cr = pd.DataFrame(cr).T
+print(cr)
+
+cm = confusion_matrix(gt_labels, pred_labels, labels=list(label2id.keys()))
+```
+
+```{python}
+#| code-fold: true
+x = list(label2id.keys())
+y = list(reversed(label2id.keys()))
+fig = ff.create_annotated_heatmap(np.flipud(cm), x=x, y=y, colorscale="Viridis")
+fig.update_layout(title_text="Confusion matrix")
+fig.add_annotation(
+    dict(
+        x=0.5,
+        y=-0.15,
+        showarrow=False,
+        text="Predicted value",
+        xref="paper",
+        yref="paper",
+    )
+)
+
+fig.add_annotation(
+    dict(
+        x=-0.16,
+        y=0.5,
+        showarrow=False,
+        text="Real value",
+        textangle=-90,
+        xref="paper",
+        yref="paper",
+    )
+)
+
+fig["data"][0]["showscale"] = True
+fig.show()
+```
+
+Теперь посмотрим на вклад каждого признака в мета модель:
+```{python}
+eli5.explain_weights(model, target_names=id2label, feature_names=X_train.columns.values)
+```
